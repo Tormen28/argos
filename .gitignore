@@ -1,0 +1,5 @@
+.argos/
+__pycache__/
+*.pyc
+scratch/
+*.log
