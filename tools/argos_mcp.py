@@ -359,7 +359,72 @@ def ws_call(project: str, payload: dict, timeout: float = 25.0, port_file: str =
             time.sleep(delay_s)
 
 def _proj(args: dict) -> str:
-    return str(args.get("project") or DEFAULT_PROJECT)
+    """Proyecto: arg `project` > env ARGOS_PROJECT > cwd si contiene project.godot."""
+    pj = args.get("project") or DEFAULT_PROJECT
+    if not pj and os.path.isfile(os.path.join(os.getcwd(), "project.godot")):
+        pj = os.getcwd()
+    return str(pj or "")
+
+
+# --- Auto-open de escena (no_scene) -------------------------------------------
+# Herramientas que necesitan una escena editada. Si el editor responde no_scene,
+# ARGOS abre `scene_path` (si se pasa) o la escena principal del proyecto
+# (application/run/main_scene) y reintenta UNA vez. Si no hay ninguna, devuelve
+# un error claro y accionable.
+SCENE_TOOLS = {
+    "argos_node_create", "argos_node_instantiate", "argos_node_reparent",
+    "argos_node_get_prop", "argos_node_set_prop", "argos_node_delete",
+    "argos_scene_save", "argos_scene_reload",
+}
+NO_SCENE_HELP = ("ARGOS: no_scene - no scene is open in the Godot editor and none could be opened "
+                 "automatically. Pass scene_path='res://your_scene.tscn', call argos_scene_open, "
+                 "or set application/run/main_scene in project.godot. / No hay escena abierta: "
+                 "pasa scene_path, usa argos_scene_open o define la escena principal.")
+
+
+def _main_scene(project: str) -> str:
+    """Lee run/main_scene de project.godot ('' si no existe)."""
+    try:
+        txt = pathlib.Path(project, "project.godot").read_text(encoding="utf-8", errors="replace")
+    except (OSError, TypeError):
+        return ""
+    section = ""
+    for line in txt.splitlines():
+        t = line.strip()
+        if t.startswith("[") and t.endswith("]"):
+            section = t[1:-1]
+            continue
+        if section == "application" and t.startswith("run/main_scene"):
+            val = t.split("=", 1)[1].strip().strip('"')
+            if val.startswith("uid://"):
+                return ""  # uid: lo resuelve el editor, no podemos abrirlo por ruta
+            return val
+    return ""
+
+
+def _with_scene(name: str, a: dict, project: str, fn):
+    out = fn()
+    if name not in SCENE_TOOLS or not out.get("isError"):
+        return out
+    if _error_code(out["content"][0]["text"]) != "no_scene":
+        return out
+    target = str(a.get("scene_path") or "") or _main_scene(project)
+    if not target.startswith("res://"):
+        return _error(NO_SCENE_HELP)
+    opened = _call(project, "scene.open", path=target)
+    if opened.get("isError"):
+        return _error(NO_SCENE_HELP + " (open %s failed: %s)" % (target, opened["content"][0]["text"]))
+    for delay in (0.2, 0.5, 1.0):
+        time.sleep(delay)
+        out = fn()
+        if not (out.get("isError") and _error_code(out["content"][0]["text"]) == "no_scene"):
+            break
+    if not out.get("isError"):
+        data = _result_data(out)
+        if isinstance(data, dict):
+            data["auto_opened_scene"] = target
+            return _result(data)
+    return out
 
 def _result(data) -> dict:
     text = json.dumps(data, ensure_ascii=False, indent=2)
@@ -518,7 +583,7 @@ def call_tool(name: str, args: dict):
     a = args or {}
     project = _proj(a)
     t0 = time.monotonic()
-    out = _call_tool_impl(name, a, project)
+    out = _with_scene(name, a, project, lambda: _call_tool_impl(name, a, project))
     try:
         _record_history(project, name, a, out, (time.monotonic() - t0) * 1000.0)
     except Exception as e:  # pragma: no cover - defensa extra
@@ -653,15 +718,15 @@ TOOLS = [
     {"name": "argos_status", "description": "Estado del editor: versión Godot, proyecto, escena editada, playing, puerto.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
     {"name": "argos_scene_tree", "description": "Árbol de nodos JSON de la escena editada (name, type, rel, script, pos). max_nodes/max_depth recortan (truncated:true).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "max_nodes": {"type": "integer", "description": "tope de nodos (default 2000, cap 20000)"}, "max_depth": {"type": "integer", "description": "tope de profundidad (default 12, cap 64)"}}}},
     {"name": "argos_scene_open", "description": "Abre una escena (res://...) en el editor.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string", "description": "res://ruta/escena.tscn"}}, "required": ["path"]}},
-    {"name": "argos_scene_save", "description": "Guarda la escena editada en disco.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_scene_reload", "description": "Recarga la escena editada desde disco.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_scene_save", "description": "Guarda la escena editada en disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
+    {"name": "argos_scene_reload", "description": "Recarga la escena editada desde disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
     {"name": "argos_scene_new", "description": "Crea una escena nueva (guarda + abre). root_class por defecto Node2D.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "root_class": {"type": "string"}, "name": {"type": "string"}}, "required": ["path"]}},
-    {"name": "argos_node_create", "description": "Crea un nodo en la escena editada. props acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "parent": {"type": "string", "description": "ruta relativa a la raíz ('' o '.' = raíz)"}, "class": {"type": "string"}, "name": {"type": "string"}, "props": {"type": "object"}}, "required": ["class"]}},
-    {"name": "argos_node_instantiate", "description": "Instancia una escena guardada bajo un padre de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene": {"type": "string"}, "parent": {"type": "string"}, "name": {"type": "string"}}, "required": ["scene"]}},
-    {"name": "argos_node_reparent", "description": "Mueve un nodo a otro padre dentro de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "parent": {"type": "string"}, "keep_transform": {"type": "boolean"}}, "required": ["path", "parent"]}},
-    {"name": "argos_node_get_prop", "description": "Lee una propiedad de un nodo (Vector/Color devueltos como @vec2:/@color:).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "prop": {"type": "string"}}, "required": ["path", "prop"]}},
-    {"name": "argos_node_set_prop", "description": "Cambia una propiedad de un nodo. Acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["path", "prop", "value"]}},
-    {"name": "argos_node_delete", "description": "Borra un nodo de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "argos_node_create", "description": "Crea un nodo en la escena editada. props acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "parent": {"type": "string", "description": "ruta relativa a la raíz ('' o '.' = raíz)"}, "class": {"type": "string"}, "name": {"type": "string"}, "props": {"type": "object"}}, "required": ["class"]}},
+    {"name": "argos_node_instantiate", "description": "Instancia una escena guardada bajo un padre de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "scene": {"type": "string"}, "parent": {"type": "string"}, "name": {"type": "string"}}, "required": ["scene"]}},
+    {"name": "argos_node_reparent", "description": "Mueve un nodo a otro padre dentro de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "parent": {"type": "string"}, "keep_transform": {"type": "boolean"}}, "required": ["path", "parent"]}},
+    {"name": "argos_node_get_prop", "description": "Lee una propiedad de un nodo (Vector/Color devueltos como @vec2:/@color:).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}}, "required": ["path", "prop"]}},
+    {"name": "argos_node_set_prop", "description": "Cambia una propiedad de un nodo. Acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["path", "prop", "value"]}},
+    {"name": "argos_node_delete", "description": "Borra un nodo de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}}, "required": ["path"]}},
     {"name": "argos_undo", "description": "Deshace la última operación del editor (historial compartido: incluye las operaciones ARGOS).", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
     {"name": "argos_redo", "description": "Rehace la última operación deshecha.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
     {"name": "argos_run_play", "description": "Ejecuta el juego (escena principal o scene_path).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string"}}}},

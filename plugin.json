@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "argos",
+  "version": "1.1.0",
+  "description": "Lets Hermes agents drive a live Godot 4 editor: scene tree, nodes, properties with real undo, play/stop, GDScript checks and screenshots, through a local MCP server.",
+  "author": {"name": "Tormen28", "url": "https://github.com/Tormen28"},
+  "homepage": "https://github.com/Tormen28/argos",
+  "repository": "https://github.com/Tormen28/argos",
+  "license": "MIT",
+  "keywords": ["godot", "gamedev", "mcp", "editor"]
+}
