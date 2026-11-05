@@ -78,15 +78,17 @@ class ValidatePayloadTest(unittest.TestCase):
         self.assertEqual(argos_mcp._validate_payload("capture.scene", base)[0], "bad_out")
         self.assertEqual(argos_mcp._validate_payload(
             "capture.scene", {"action": "capture.scene", "out": ""})[0], "bad_out")
+        self.assertEqual(argos_mcp._validate_payload(
+            "capture.scene", {"action": "capture.scene", "out": "C:/tmp/x.PNG"})[0], "bad_out")
         self.assertIsNone(argos_mcp._validate_payload(
-            "capture.scene", {"action": "capture.scene", "out": "C:/tmp/x.PNG"}))
+            "capture.scene", {"action": "capture.scene", "out": "res://shots/x.PNG"}))
         self.assertEqual(argos_mcp._validate_payload(
             "runtime.capture", {"action": "runtime.capture", "out": "x.jpg"})[0], "bad_out")
 
     def test_capture_size_frontera(self):
         def chk(w, h):
             return argos_mcp._validate_payload(
-                "capture.scene", {"action": "capture.scene", "out": "x.png", "w": w, "h": h})
+                "capture.scene", {"action": "capture.scene", "out": "res://.argos/captures/x.png", "w": w, "h": h})
         self.assertEqual(chk(15, 648)[0], "bad_size")
         self.assertEqual(chk(4097, 648)[0], "bad_size")
         self.assertEqual(chk(1152, 15)[0], "bad_size")

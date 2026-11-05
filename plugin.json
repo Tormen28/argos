@@ -7,5 +7,12 @@
   "homepage": "https://github.com/Tormen28/argos",
   "repository": "https://github.com/Tormen28/argos",
   "license": "MIT",
-  "keywords": ["godot", "gamedev", "mcp", "editor"]
+  "keywords": ["godot", "gamedev", "mcp", "editor"],
+  "extensions": {
+    "com.nousresearch.hermes": {
+      "servers": {
+        "argos": {"trust": "untrusted"}
+      }
+    }
+  }
 }

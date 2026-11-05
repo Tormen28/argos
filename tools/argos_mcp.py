@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""argos_mcp.py — Servidor MCP (stdio) del portal ARGOS (Hermes <-> Godot).
+"""argos_mcp.py — MCP (stdio) server for the ARGOS portal (Hermes <-> Godot).
 
-Expone el editor de Godot como herramientas MCP. Requiere el addon ARGOS activo
-en el proyecto y el editor abierto (headless o con ventana).
+Exposes the Godot editor as MCP tools. The ARGOS addon must be enabled and
+the editor open (headless or windowed).
 
 Env:
-  ARGOS_PROJECT : ruta del proyecto por defecto (cada tool puede sobreescribirlo)
-  ARGOS_GODOT   : ruta al ejecutable de Godot (para argos_editor_launch)
+  ARGOS_PROJECT: default Godot project. argos_editor_launch, argos_check and
+      argos_run_play refuse any project outside this path or
+      ARGOS_ALLOWED_PROJECTS.
+  ARGOS_ALLOWED_PROJECTS: os.pathsep-separated extra project directories
+      allowed for launch, check and play.
+  ARGOS_GODOT: Godot executable used by argos_editor_launch.
 """
 import asyncio
 import json
@@ -39,10 +43,40 @@ except ImportError:
     sys.exit(2)
 
 DEFAULT_PROJECT = os.environ.get("ARGOS_PROJECT", "")
-DEFAULT_GODOT = os.environ.get(
-    "ARGOS_GODOT",
-    os.path.expanduser("~/tools/godot/4.7.2-stable/Godot_v4.7.2-stable_win64_console.exe"),
-)
+try:
+    from argos_editor import default_godot_executable
+except ImportError:  # pragma: no cover - sólo si se ejecuta fuera de tools/
+    def default_godot_executable() -> str:
+        return "godot" if os.name != "nt" else ""
+DEFAULT_GODOT = os.environ.get("ARGOS_GODOT", default_godot_executable())
+
+# launch / check / play ejecutan el proyecto (plugins de editor, @tool, GDScript).
+# Solo aceptan ARGOS_PROJECT o ARGOS_ALLOWED_PROJECTS.
+PROCESS_PROJECT_TOOLS = frozenset({
+    "argos_editor_launch",
+    "argos_check",
+    "argos_run_play",
+})
+# argos_raw can forward play; that path executes project GDScript too.
+_PLAY_ACTIONS = frozenset({"run.play_main", "run.play_scene"})
+
+
+def _gates_project(name: str, args: dict) -> bool:
+    if name in PROCESS_PROJECT_TOOLS:
+        return True
+    if name == "argos_raw" and str((args or {}).get("action", "")) in _PLAY_ACTIONS:
+        return True
+    return False
+
+
+_READ_ONLY_TOOLS = frozenset({
+    "argos_ping",
+    "argos_status",
+    "argos_scene_tree",
+    "argos_node_get_prop",
+    "argos_runtime_info",
+    "argos_history",
+})
 
 # --- Retry con backoff (BLOQUE A-1) -------------------------------------------
 # Si el editor está reimportando o el WS cae transitoriamente, la operación se
@@ -180,9 +214,98 @@ def _rate_check(project: str, action: str):
     return int(max(1.0, (1.0 - b["tokens"]) / rate) * 1000.0)
 
 
-def _check_out(out_path: str):
-    if not out_path or not out_path.lower().endswith(".png"):
-        return ("bad_out", "se espera ruta .png")
+def _capture_segments(path: str):
+    return str(path).replace("\\", "/").split("/")
+
+
+def _capture_has_dotdot(path: str) -> bool:
+    return ".." in _capture_segments(path)
+
+
+def _capture_is_absolute(path: str) -> bool:
+    norm = str(path).replace("\\", "/")
+    if norm.startswith("/"):
+        return True
+    if path.startswith("\\\\"):
+        return True
+    if len(norm) >= 3 and norm[0].isalpha() and norm[1] == ":" and norm[2] == "/":
+        return True
+    return pathlib.Path(path).is_absolute()
+
+
+def _collapse_capture_rel(rel: str) -> str:
+    kept = []
+    for seg in str(rel).split("/"):
+        if seg in ("", "."):
+            continue
+        kept.append(seg)
+    return "/".join(kept)
+
+
+def _capture_inside(project: str, rel: str, under_captures: bool):
+    """None if `rel` stays inside the project (and captures, when required)."""
+    try:
+        root = pathlib.Path(project).expanduser().resolve()
+        dest = (root / rel).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ("bad_out", "could not resolve capture path")
+    try:
+        dest.relative_to(root)
+    except ValueError:
+        return ("bad_out", "PNG must stay inside the project")
+    if under_captures:
+        try:
+            captures = (root / ".argos" / "captures").resolve()
+            captures.relative_to(root)
+            if dest == captures:
+                return ("bad_out", "expected a .png file")
+            dest.relative_to(captures)
+        except ValueError:
+            return ("bad_out", "PNG must stay under project/.argos/captures")
+    if dest.exists():
+        return ("file_exists", "refusing to overwrite an existing file")
+    return None
+
+
+def _check_out(out_path: str, project: str = ""):
+    """PNG output must be res:// or project/.argos/captures/.
+
+    Rejects absolute paths and any `..` segment, and refuses to overwrite.
+    """
+    raw = str(out_path or "").strip()
+    if not raw or not raw.lower().endswith(".png"):
+        return ("bad_out", "expected a .png path")
+    if "\x00" in raw:
+        return ("bad_out", "path contains NUL")
+    if _capture_has_dotdot(raw):
+        return ("bad_out", "path must not contain '..'")
+    norm = raw.replace("\\", "/")
+    if norm.startswith("res://"):
+        rest = norm[6:]
+        if rest.startswith("/") or _capture_is_absolute(rest):
+            return ("bad_out", "absolute paths are not allowed")
+        rel = _collapse_capture_rel(rest)
+        if not rel.lower().endswith(".png"):
+            return ("bad_out", "expected a .png file")
+        if project:
+            err = _capture_inside(project, rel, under_captures=False)
+            if err:
+                return err
+        return None
+    if _capture_is_absolute(raw) or _capture_is_absolute(norm):
+        return ("bad_out", "absolute paths are not allowed")
+    rel = norm
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = _collapse_capture_rel(rel)
+    if not rel.startswith(".argos/captures/") or rel.endswith("/"):
+        return ("bad_out", "PNG must be under project/.argos/captures or res://")
+    if not rel.lower().endswith(".png"):
+        return ("bad_out", "expected a .png file")
+    if project:
+        err = _capture_inside(project, rel, under_captures=True)
+        if err:
+            return err
     return None
 
 
@@ -199,7 +322,7 @@ def _check_size(w, h):
     return None
 
 
-def _validate_payload(action: str, payload):
+def _validate_payload(action: str, payload, project: str = ""):
     """Comprueba tamaño/paths/props ANTES de enviar al plugin (fail-fast).
 
     Devuelve None si es válido, o (error_code, detail). Espeja los caps del
@@ -215,18 +338,18 @@ def _validate_payload(action: str, payload):
         if not str(payload.get("path", "")).startswith("res://"):
             return ("bad_path", "se espera res://...")
     if action == "capture.scene":
-        err = _check_out(str(payload.get("out", "")))
+        err = _check_out(str(payload.get("out", "")), project)
         if err:
             return err
         err = _check_size(payload.get("w"), payload.get("h"))
         if err:
             return err
     if action == "capture.editor_2d":
-        err = _check_out(str(payload.get("path", "")))
+        err = _check_out(str(payload.get("path", "")), project)
         if err:
             return err
     if action == "runtime.capture":
-        err = _check_out(str(payload.get("out", "")))
+        err = _check_out(str(payload.get("out", "")), project)
         if err:
             return err
     if action == "node.create":
@@ -318,7 +441,7 @@ def ws_call(project: str, payload: dict, timeout: float = 25.0, port_file: str =
     """
     global _CONN, _CONN_KEY
     # §3.4: valida tamaño/paths/props antes de gastar un round-trip.
-    verr = _validate_payload(str(payload.get("action", "")), payload)
+    verr = _validate_payload(str(payload.get("action", "")), payload, project)
     if verr:
         return {"ok": False, "id": payload.get("id", 1), "error": verr[0], "detail": verr[1]}
     total = 1 + RETRY_MAX_RETRIES
@@ -364,6 +487,95 @@ def _proj(args: dict) -> str:
     if not pj and os.path.isfile(os.path.join(os.getcwd(), "project.godot")):
         pj = os.getcwd()
     return str(pj or "")
+
+
+def _resolve_dir(raw: str):
+    try:
+        return pathlib.Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _allowlist_entries():
+    """Resolved project directories launch/check/play may touch.
+
+    ARGOS_PROJECT (DEFAULT_PROJECT, fixed at import) plus ARGOS_ALLOWED_PROJECTS
+    (os.pathsep-separated, read on each call).
+    """
+    raws = []
+    if str(DEFAULT_PROJECT).strip():
+        raws.append(str(DEFAULT_PROJECT).strip())
+    blob = os.environ.get("ARGOS_ALLOWED_PROJECTS", "")
+    for line in str(blob).replace("\r", "\n").split("\n"):
+        for part in line.split(os.pathsep):
+            if part.strip():
+                raws.append(part.strip())
+    out = []
+    seen = set()
+    for raw in raws:
+        if "\x00" in raw:
+            continue
+        path = _resolve_dir(raw)
+        if path is None:
+            continue
+        key = os.path.normcase(os.path.normpath(str(path)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _match_allowlist(requested: str, entries):
+    if "\x00" in str(requested):
+        return None
+    path = _resolve_dir(str(requested).strip())
+    if path is None:
+        return None
+    key = os.path.normcase(os.path.normpath(str(path)))
+    for entry in entries:
+        if os.path.normcase(os.path.normpath(str(entry))) == key:
+            return entry
+    return None
+
+
+def _project_refused(detail: str) -> dict:
+    return _error("ARGOS: project_not_allowed " + detail)
+
+
+def _enforce_allowed_project(requested):
+    """Return (canonical project, None) or (None, MCP error).
+
+    Used by argos_editor_launch, argos_check and argos_run_play. A per-call
+    project outside ARGOS_PROJECT / ARGOS_ALLOWED_PROJECTS is refused. When
+    the call omits project, ARGOS_PROJECT is used, or the sole allowlist entry.
+    """
+    entries = _allowlist_entries()
+    if not entries:
+        return None, _project_refused(
+            "Set ARGOS_PROJECT or ARGOS_ALLOWED_PROJECTS before launch, check or play. "
+            "These tools refuse every project that is not on that allowlist. "
+            "/ Define ARGOS_PROJECT o ARGOS_ALLOWED_PROJECTS; launch, check y play "
+            "rechazan cualquier proyecto fuera de esa lista.")
+    req = str(requested or "").strip()
+    if not req:
+        preferred = str(DEFAULT_PROJECT).strip()
+        if preferred:
+            got = _match_allowlist(preferred, entries)
+            if got is not None:
+                return str(got), None
+        if len(entries) == 1:
+            return str(entries[0]), None
+        return None, _project_refused(
+            "Several projects are allowlisted; pass project set to one of them. "
+            "/ Hay varios proyectos en la lista; indica project.")
+    got = _match_allowlist(req, entries)
+    if got is None:
+        return None, _project_refused(
+            "That project is outside the allowlist (ARGOS_PROJECT / ARGOS_ALLOWED_PROJECTS). "
+            "launch, check and play will not open it. "
+            "/ Ese proyecto está fuera de la lista permitida.")
+    return str(got), None
 
 
 # --- Auto-open de escena (no_scene) -------------------------------------------
@@ -579,8 +791,16 @@ def call_tool(name: str, args: dict):
     El servidor MCP es el ESCRITOR UNICO de `.argos/history.json` (§2.1): se
     registra justo antes de responder, con duracion y resultado. El registro es
     fail-silent: nunca rompe la operacion MCP.
+
+    launch / check / play se rechazan ANTES de escribir historial si el proyecto
+    no está en la allowlist: no se crea `.argos/` en un directorio ajeno.
     """
-    a = args or {}
+    a = dict(args or {})
+    if _gates_project(name, a):
+        allowed, err = _enforce_allowed_project(a.get("project"))
+        if err is not None:
+            return err
+        a["project"] = allowed
     project = _proj(a)
     t0 = time.monotonic()
     out = _with_scene(name, a, project, lambda: _call_tool_impl(name, a, project))
@@ -593,6 +813,12 @@ def call_tool(name: str, args: dict):
 
 def _call_tool_impl(name: str, a: dict, project: str):
     try:
+        if _gates_project(name, a):
+            allowed, err = _enforce_allowed_project(a.get("project") or project)
+            if err is not None:
+                return err
+            project = allowed
+            a["project"] = allowed
         # §3.3: rate guard opcional sobre acciones mutantes (lecturas exentas).
         mut_action = _action_of(name, a)
         if _is_mutating(mut_action):
@@ -710,38 +936,55 @@ def _call_tool_impl(name: str, a: dict, project: str):
                        name, type(e).__name__, e, _heartbeat_verdict(project))
         return _error(f"ARGOS excepción: {type(e).__name__}: {e}")
 
-def _pj(desc="Ruta del proyecto Godot (opcional si ARGOS_PROJECT está definido)"):
+def _pj(desc="Godot project directory (optional when ARGOS_PROJECT is set). launch, check and play accept only ARGOS_PROJECT or ARGOS_ALLOWED_PROJECTS. / Directorio del proyecto (opcional si ARGOS_PROJECT esta definido). launch, check y play solo aceptan esa lista."):
     return {"type": "string", "description": desc}
 
-TOOLS = [
-    {"name": "argos_ping", "description": "Ping al editor Godot (comprueba que ARGOS responde).", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_status", "description": "Estado del editor: versión Godot, proyecto, escena editada, playing, puerto.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_scene_tree", "description": "Árbol de nodos JSON de la escena editada (name, type, rel, script, pos). max_nodes/max_depth recortan (truncated:true).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "max_nodes": {"type": "integer", "description": "tope de nodos (default 2000, cap 20000)"}, "max_depth": {"type": "integer", "description": "tope de profundidad (default 12, cap 64)"}}}},
-    {"name": "argos_scene_open", "description": "Abre una escena (res://...) en el editor.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string", "description": "res://ruta/escena.tscn"}}, "required": ["path"]}},
-    {"name": "argos_scene_save", "description": "Guarda la escena editada en disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
-    {"name": "argos_scene_reload", "description": "Recarga la escena editada desde disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
-    {"name": "argos_scene_new", "description": "Crea una escena nueva (guarda + abre). root_class por defecto Node2D.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "root_class": {"type": "string"}, "name": {"type": "string"}}, "required": ["path"]}},
-    {"name": "argos_node_create", "description": "Crea un nodo en la escena editada. props acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "parent": {"type": "string", "description": "ruta relativa a la raíz ('' o '.' = raíz)"}, "class": {"type": "string"}, "name": {"type": "string"}, "props": {"type": "object"}}, "required": ["class"]}},
-    {"name": "argos_node_instantiate", "description": "Instancia una escena guardada bajo un padre de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "scene": {"type": "string"}, "parent": {"type": "string"}, "name": {"type": "string"}}, "required": ["scene"]}},
-    {"name": "argos_node_reparent", "description": "Mueve un nodo a otro padre dentro de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "parent": {"type": "string"}, "keep_transform": {"type": "boolean"}}, "required": ["path", "parent"]}},
-    {"name": "argos_node_get_prop", "description": "Lee una propiedad de un nodo (Vector/Color devueltos como @vec2:/@color:).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}}, "required": ["path", "prop"]}},
-    {"name": "argos_node_set_prop", "description": "Cambia una propiedad de un nodo. Acepta @vec2:x,y y @color:r,g,b,a.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["path", "prop", "value"]}},
-    {"name": "argos_node_delete", "description": "Borra un nodo de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "argos_undo", "description": "Deshace la última operación del editor (historial compartido: incluye las operaciones ARGOS).", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_redo", "description": "Rehace la última operación deshecha.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_run_play", "description": "Ejecuta el juego (escena principal o scene_path).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string"}}}},
-    {"name": "argos_run_stop", "description": "Detiene el juego en ejecución.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_capture_scene", "description": "Renderiza una escena a PNG (offscreen, requiere editor CON VENTANA). Luego revisa el PNG con visión.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "out": {"type": "string", "description": "ruta absoluta del .png de salida"}, "scene_path": {"type": "string"}, "w": {"type": "integer"}, "h": {"type": "integer"}}, "required": ["out"]}},
-    {"name": "argos_runtime_info", "description": "Info del JUEGO EN EJECUCIÓN (fps, escena, frames). Requiere el juego corriendo (debug).", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_runtime_capture", "description": "Captura PNG del JUEGO EN EJECUCIÓN (gameplay real, requiere ventana). Luego revisar con visión.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "out": {"type": "string"}, "wait_frames": {"type": "integer"}}, "required": ["out"]}},
-    {"name": "argos_fs_scan", "description": "Re-escanea el sistema de archivos del proyecto (tras escribir archivos por fuera).", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_check", "description": "Valida scripts GDScript (.gd) con Godot --check-only y devuelve errores ESTRUCTURADOS (archivo:línea + mensaje) para autocorrección. Usa paths:[...] o all:true (excluye addons/ y .godot/).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "paths": {"type": "array", "items": {"type": "string"}, "description": "rutas res:// de scripts .gd a validar"}, "all": {"type": "boolean", "description": "valida todos los .gd del proyecto (excluye addons/ y .godot/)"}}}},
-    {"name": "argos_history", "description": "Historial de operaciones ARGOS (.argos/history.json): acción, params, status, error, duración. Filtros limit (<=200), since (ISO8601), tool, status.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "limit": {"type": "integer", "description": "max entradas (default 50, cap 200)"}, "since": {"type": "string", "description": "ISO8601; solo entradas posteriores"}, "tool": {"type": "string"}, "status": {"type": "string", "enum": ["ok", "error"]}}}},
-    {"name": "argos_editor_launch", "description": "Lanza el editor Godot del proyecto (headless por defecto; espera al puerto).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "headless": {"type": "boolean"}, "wait_s": {"type": "integer"}}}},
-    {"name": "argos_editor_stop", "description": "Detiene el editor Godot lanzado por ARGOS.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
-    {"name": "argos_editor_quit", "description": "Cierra el editor (guarda escenas antes; force=true evita guardar).", "inputSchema": {"type": "object", "properties": {"project": _pj(), "force": {"type": "boolean"}}}},
-    {"name": "argos_raw", "description": "Escape hatch: envía cualquier acción ARGOS con payload JSON.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "action": {"type": "string"}, "payload": {"type": "object"}}, "required": ["action"]}},
-]
+
+def _apply_readonly(tools):
+    """readOnlyHint only on genuine reads. Strip it from anything that mutates."""
+    for tool in tools:
+        annotations = dict(tool.get("annotations") or {})
+        if tool["name"] in _READ_ONLY_TOOLS:
+            annotations["readOnlyHint"] = True
+            tool["annotations"] = annotations
+        else:
+            annotations.pop("readOnlyHint", None)
+            if annotations:
+                tool["annotations"] = annotations
+            else:
+                tool.pop("annotations", None)
+    return tools
+
+
+TOOLS = _apply_readonly([
+    {"name": "argos_ping", "description": "Ping the Godot editor and check that ARGOS answers. / Ping al editor para comprobar que ARGOS responde.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_status", "description": "Editor status: Godot version, project, edited scene, playing flag and port. / Estado del editor: version, proyecto, escena, playing y puerto.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_scene_tree", "description": "JSON node tree of the edited scene (name, type, rel, script, pos). max_nodes and max_depth trim it (truncated: true). / Arbol JSON de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "max_nodes": {"type": "integer", "description": "max nodes (default 2000, cap 20000)"}, "max_depth": {"type": "integer", "description": "max depth (default 12, cap 64)"}}}},
+    {"name": "argos_scene_open", "description": "Open a scene (res://...) in the editor. / Abre una escena en el editor.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string", "description": "res://path/scene.tscn"}}, "required": ["path"]}},
+    {"name": "argos_scene_save", "description": "Save the edited scene to disk. / Guarda la escena editada en disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
+    {"name": "argos_scene_reload", "description": "Reload the edited scene from disk. / Recarga la escena editada desde disco.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}}}},
+    {"name": "argos_scene_new", "description": "Create a new scene (save and open it). Default root_class is Node2D. / Crea una escena nueva.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "path": {"type": "string"}, "root_class": {"type": "string"}, "name": {"type": "string"}}, "required": ["path"]}},
+    {"name": "argos_node_create", "description": "Create a node in the edited scene. props accepts @vec2:x,y and @color:r,g,b,a. / Crea un nodo en la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "parent": {"type": "string", "description": "path relative to the root ('' or '.' = root)"}, "class": {"type": "string"}, "name": {"type": "string"}, "props": {"type": "object"}}, "required": ["class"]}},
+    {"name": "argos_node_instantiate", "description": "Instance a saved scene under a parent in the edited scene. / Instancia una escena guardada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "scene": {"type": "string"}, "parent": {"type": "string"}, "name": {"type": "string"}}, "required": ["scene"]}},
+    {"name": "argos_node_reparent", "description": "Move a node under another parent in the edited scene. / Mueve un nodo a otro padre.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "parent": {"type": "string"}, "keep_transform": {"type": "boolean"}}, "required": ["path", "parent"]}},
+    {"name": "argos_node_get_prop", "description": "Read a node property (Vector and Color come back as @vec2: and @color:). / Lee una propiedad de un nodo.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}}, "required": ["path", "prop"]}},
+    {"name": "argos_node_set_prop", "description": "Set a node property. Accepts @vec2:x,y and @color:r,g,b,a. / Cambia una propiedad de un nodo.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["path", "prop", "value"]}},
+    {"name": "argos_node_delete", "description": "Delete a node from the edited scene. / Borra un nodo de la escena editada.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string", "description": "optional res:// scene to open if none is open"}, "path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "argos_undo", "description": "Undo the editor's last operation (shared history, including ARGOS edits). / Deshace la ultima operacion del editor.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_redo", "description": "Redo the last undone operation. / Rehace la ultima operacion deshecha.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_run_play", "description": "Play the game (main scene, or scene_path). The project must be ARGOS_PROJECT or on ARGOS_ALLOWED_PROJECTS. / Ejecuta el juego; el proyecto tiene que estar en la lista permitida.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "scene_path": {"type": "string"}}}},
+    {"name": "argos_run_stop", "description": "Stop the running game. / Detiene el juego en ejecucion.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_capture_scene", "description": "Render a scene to PNG (offscreen; the editor needs a window), then review the PNG. Output must be res://....png or .argos/captures/....png, with no '..' and no overwrite. / Renderiza una escena a PNG solo en esas rutas.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "out": {"type": "string", "description": "res://....png or .argos/captures/....png (no absolute paths, no '..', no overwrite)"}, "scene_path": {"type": "string"}, "w": {"type": "integer"}, "h": {"type": "integer"}}, "required": ["out"]}},
+    {"name": "argos_runtime_info", "description": "Info from the RUNNING game (fps, scene, frames). The game must be running in debug. / Info del juego en ejecucion.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_runtime_capture", "description": "PNG of the RUNNING game (real gameplay; needs a window). Output must be res://....png or .argos/captures/....png, with no '..' and no overwrite. / Captura PNG del juego solo en esas rutas.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "out": {"type": "string", "description": "res://....png or .argos/captures/....png (no absolute paths, no '..', no overwrite)"}, "wait_frames": {"type": "integer"}}, "required": ["out"]}},
+    {"name": "argos_fs_scan", "description": "Rescan the project filesystem after files were written from outside the editor. / Reescanea el sistema de archivos del proyecto.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_check", "description": "Validate GDScript (.gd) with Godot --check-only and return structured errors (file:line + message). Use paths:[...] or all:true (skips addons/ and .godot/). The project must be allowlisted. / Valida scripts y devuelve errores estructurados.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "paths": {"type": "array", "items": {"type": "string"}, "description": "res:// paths of .gd scripts to validate"}, "all": {"type": "boolean", "description": "validate every project .gd (skips addons/ and .godot/)"}}}},
+    {"name": "argos_history", "description": "ARGOS operation history (.argos/history.json): action, params, status, error, duration. Filters: limit (<=200), since (ISO8601), tool, status. / Historial de operaciones ARGOS.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "limit": {"type": "integer", "description": "max entries (default 50, cap 200)"}, "since": {"type": "string", "description": "ISO8601; only later entries"}, "tool": {"type": "string"}, "status": {"type": "string", "enum": ["ok", "error"]}}}},
+    {"name": "argos_editor_launch", "description": "Launch the Godot editor for an allowlisted project (headless by default; waits for the port). / Lanza el editor de un proyecto permitido.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "headless": {"type": "boolean"}, "wait_s": {"type": "integer"}}}},
+    {"name": "argos_editor_stop", "description": "Stop the Godot editor that ARGOS launched. / Detiene el editor lanzado por ARGOS.", "inputSchema": {"type": "object", "properties": {"project": _pj()}}},
+    {"name": "argos_editor_quit", "description": "Quit the editor (saves scenes first; force=true skips saving). / Cierra el editor.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "force": {"type": "boolean"}}}},
+    {"name": "argos_raw", "description": "Escape hatch: send any ARGOS action with a JSON payload. / Envia cualquier accion ARGOS con un payload JSON.", "inputSchema": {"type": "object", "properties": {"project": _pj(), "action": {"type": "string"}, "payload": {"type": "object"}}, "required": ["action"]}},
+])
 
 def send_obj(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -766,7 +1009,7 @@ def main():
                 send_obj({"jsonrpc": "2.0", "id": mid, "result": {
                     "protocolVersion": pv,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "argos", "version": "1.0.0"},
+                    "serverInfo": {"name": "argos", "version": "1.1.0"},
                 }})
             elif method in ("notifications/initialized", "initialized"):
                 pass

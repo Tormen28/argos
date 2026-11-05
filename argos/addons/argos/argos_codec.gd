@@ -93,3 +93,75 @@ static func dump_node(n: Node, root: Node, budget: Dictionary, depth: int, max_d
 	if not kids.is_empty():
 		d["children"] = kids
 	return d
+
+
+# --- capturas (PNG) -----------------------------------------------------------
+# Solo res://...png o .argos/captures/...png. Se rechazan rutas absolutas y
+# cualquier segmento "..", y no se pisa un archivo existente.
+
+static func check_capture_out(out_path: String) -> Dictionary:
+	## "" en error si la ruta es escribible. Si no: bad_out o file_exists.
+	## res_path es la ruta res:// canonica a la que hay que guardar.
+	var raw := out_path.strip_edges()
+	if raw.is_empty() or not raw.to_lower().ends_with(".png"):
+		return {"error": "bad_out", "detail": "expected a .png path", "res_path": ""}
+	if raw.contains(char(0)):
+		return {"error": "bad_out", "detail": "path contains NUL", "res_path": ""}
+	var norm := raw.replace("\\", "/")
+	if norm.split("/").has(".."):
+		return {"error": "bad_out", "detail": "path must not contain '..'", "res_path": ""}
+	var res_path := ""
+	if norm.begins_with("res://"):
+		var rest := norm.substr(6)
+		if rest.begins_with("/") or _capture_path_is_absolute(rest):
+			return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+		res_path = "res://" + _collapse_capture_rel(rest)
+	else:
+		if _capture_path_is_absolute(norm):
+			return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+		var rel := norm
+		while rel.begins_with("./"):
+			rel = rel.substr(2)
+		rel = _collapse_capture_rel(rel)
+		if not rel.begins_with(".argos/captures/") or rel.ends_with("/"):
+			return {"error": "bad_out", "detail": "PNG must be under .argos/captures or res://", "res_path": ""}
+		res_path = "res://" + rel
+	if not res_path.to_lower().ends_with(".png") or res_path.ends_with("/"):
+		return {"error": "bad_out", "detail": "expected a .png file", "res_path": ""}
+	if FileAccess.file_exists(res_path):
+		return {"error": "file_exists", "detail": "refusing to overwrite an existing file", "res_path": ""}
+	var global_path := ProjectSettings.globalize_path(res_path)
+	if DirAccess.dir_exists_absolute(global_path):
+		return {"error": "file_exists", "detail": "refusing to overwrite an existing file", "res_path": ""}
+	return {"error": "", "detail": "", "res_path": res_path}
+
+
+static func prepare_capture_dir(res_path: String) -> void:
+	var parent := res_path.get_base_dir()
+	if parent.is_empty():
+		return
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(parent))
+
+
+static func _collapse_capture_rel(rel: String) -> String:
+	var kept := PackedStringArray()
+	for seg in rel.split("/"):
+		if seg.is_empty() or seg == ".":
+			continue
+		kept.append(seg)
+	return "/".join(kept)
+
+
+static func _capture_path_is_absolute(norm: String) -> bool:
+	if norm.begins_with("/") or norm.begins_with("//"):
+		return true
+	if norm.length() >= 3 and norm.substr(1, 2) == ":/" and _capture_is_drive_letter(norm.substr(0, 1)):
+		return true
+	return false
+
+
+static func _capture_is_drive_letter(ch: String) -> bool:
+	if ch.is_empty():
+		return false
+	var c := ch.unicode_at(0)
+	return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)

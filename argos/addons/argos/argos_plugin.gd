@@ -1,6 +1,6 @@
 @tool
 extends EditorPlugin
-## ARGOS — Portal Godot (v1.0.0): edición de escenas desde fuera del editor, con undo/redo, cierre seguro y propiedades veraces.
+## ARGOS — Portal Godot (v1.1.0): edición de escenas desde fuera del editor, con undo/redo, cierre seguro y propiedades veraces.
 ## Servidor WebSocket local (127.0.0.1) para control del editor desde Hermes.
 ## Protocolo: JSON {id, token, action, ...payload} -> {ok, id, result|error, detail}
 ## BLOQUE A-2: heartbeat en .argos/heartbeat cada <=30 s (distinguir «reimportando» de «editor muerto»).
@@ -58,7 +58,6 @@ var _last_hb := -1
 var _batch: Dictionary = {}
 
 func _enter_tree() -> void:
-	randomize()
 	_ensure_credentials()
 	# BLOQUE A-2: heartbeat inmediato al activarse + periodico desde _process
 	_write_heartbeat()
@@ -132,8 +131,8 @@ func _ensure_credentials() -> void:
 		var gd := FileAccess.open("res://.argos/.gdignore", FileAccess.WRITE)
 		if gd:
 			gd.store_string("")
-	# Rotacion por sesion (COUNCIL-010): token nuevo en cada arranque del editor
-	_token = "%08x%08x%08x%08x" % [randi(), randi(), randi(), randi()]
+	# Rotacion por sesion (COUNCIL-010): token CSPRNG nuevo en cada arranque.
+	_token = new_session_token()
 	var ft := FileAccess.open(TOKEN_FILE, FileAccess.WRITE)
 	if ft:
 		ft.store_string(_token)
@@ -687,15 +686,19 @@ func _history() -> UndoRedo:
 
 func _capture_scene(pid: int, rid: Variant, msg: Dictionary) -> void:
 	# B1: la validación de entrada precede al chequeo de entorno (errores estables
-	# en headless: bad_out/bad_size en vez de headless).
+	# en headless: bad_out/bad_size en vez de headless). El tamaño se informa
+	# antes del confinamiento de ruta para conservar ese código.
 	var out_path := str(msg.get("out", ""))
 	if not out_path.to_lower().ends_with(".png"):
-		_send(pid, _err(rid, "bad_out", "se espera ruta .png"))
+		_send(pid, _err(rid, "bad_out", "expected a .png path"))
 		return
 	var w := int(msg.get("w", 1152))
 	var h := int(msg.get("h", 648))
 	if w < CAPTURE_MIN or w > CAPTURE_MAX or h < CAPTURE_MIN or h > CAPTURE_MAX:
 		_send(pid, _err(rid, "bad_size", "%dx%d (rango %d..%d)" % [w, h, CAPTURE_MIN, CAPTURE_MAX]))
+		return
+	var gate := Codec.check_capture_out(out_path)
+	if not _capture_gate_ok(pid, rid, gate):
 		return
 	if DisplayServer.get_name() == "headless":
 		_send(pid, _err(rid, "headless", "captura requiere editor CON VENTANA (no headless)"))
@@ -735,16 +738,19 @@ func _capture_scene(pid: int, rid: Variant, msg: Dictionary) -> void:
 		return
 	var iw := img.get_width()
 	var ih := img.get_height()
-	var err := img.save_png(out_path)
-	if err != OK:
-		_send(pid, _err(rid, "save_failed", str(err)))
+	var saved := _save_capture_png(img, str(gate["res_path"]))
+	if str(saved["error"]) != "":
+		_send(pid, _err(rid, str(saved["error"]), str(saved["detail"])))
 		return
-	_send(pid, _ok(rid, {"path": out_path, "w": iw, "h": ih, "scene": scene_path}))
+	_send(pid, _ok(rid, {"path": str(gate["res_path"]), "w": iw, "h": ih, "scene": scene_path}))
 
 func _capture_editor_2d(pid: int, rid: Variant, msg: Dictionary) -> void:
 	var out_path := str(msg.get("path", ""))
 	if not out_path.to_lower().ends_with(".png"):
-		_send(pid, _err(rid, "bad_out", "se espera ruta .png"))
+		_send(pid, _err(rid, "bad_out", "expected a .png path"))
+		return
+	var gate := Codec.check_capture_out(out_path)
+	if not _capture_gate_ok(pid, rid, gate):
 		return
 	if DisplayServer.get_name() == "headless":
 		_send(pid, _err(rid, "headless", "captura requiere editor CON VENTANA (no headless)"))
@@ -768,13 +774,41 @@ func _capture_editor_2d(pid: int, rid: Variant, msg: Dictionary) -> void:
 	if img == null or img.get_width() == 0:
 		_send(pid, _err(rid, "empty_image", "headless?"))
 		return
-	var err := img.save_png(out_path)
-	if err != OK:
-		_send(pid, _err(rid, "save_failed", str(err)))
+	var saved := _save_capture_png(img, str(gate["res_path"]))
+	if str(saved["error"]) != "":
+		_send(pid, _err(rid, str(saved["error"]), str(saved["detail"])))
 		return
-	_send(pid, _ok(rid, {"path": out_path, "w": img.get_width(), "h": img.get_height()}))
+	_send(pid, _ok(rid, {"path": str(gate["res_path"]), "w": img.get_width(), "h": img.get_height()}))
 
 # ---- estado / transporte ----
+
+static func new_session_token() -> String:
+	## 16 bytes from Crypto.generate_random_bytes, as hex.
+	var crypto := Crypto.new()
+	var raw := crypto.generate_random_bytes(16)
+	var hex := ""
+	for b in raw:
+		hex += "%02x" % b
+	return hex
+
+
+func _capture_gate_ok(pid: int, rid: Variant, gate: Dictionary) -> bool:
+	if str(gate.get("error", "")) != "" or str(gate.get("res_path", "")).is_empty():
+		var code := str(gate.get("error", "bad_out"))
+		if code.is_empty():
+			code = "bad_out"
+		_send(pid, _err(rid, code, str(gate.get("detail", ""))))
+		return false
+	return true
+
+
+func _save_capture_png(img: Image, res_path: String) -> Dictionary:
+	Codec.prepare_capture_dir(res_path)
+	var err := img.save_png(res_path)
+	if err != OK:
+		return {"error": "save_failed", "detail": str(err)}
+	return {"error": "", "detail": ""}
+
 
 func _status() -> Dictionary:
 	var root := EditorInterface.get_edited_scene_root()
