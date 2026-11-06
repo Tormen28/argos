@@ -136,6 +136,71 @@ static func check_capture_out(out_path: String) -> Dictionary:
 	return {"error": "", "detail": "", "res_path": res_path}
 
 
+static func check_capture_request(out_path: String, session: String = "") -> Dictionary:
+	## Same gates as check_capture_out, plus an optional capture session.
+	## Session names are [A-Za-z0-9_-]{1,64}. Files land in
+	## .argos/captures/<session>/. An empty out_path allocates frame_NNN.png.
+	## A session cannot retarget res://, absolute paths, or "..".
+	var sess_detail := _capture_session_error(session)
+	if sess_detail != "":
+		return {"error": "bad_session", "detail": sess_detail, "res_path": ""}
+	var sess := session.strip_edges()
+	var raw := out_path.strip_edges()
+	if raw.contains(char(0)):
+		return {"error": "bad_out", "detail": "path contains NUL", "res_path": ""}
+	var norm := raw.replace("\\", "/")
+	if norm.split("/").has(".."):
+		return {"error": "bad_out", "detail": "path must not contain '..'", "res_path": ""}
+	if _capture_path_is_absolute(norm):
+		return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+	if sess != "" and norm.begins_with("res://"):
+		return {"error": "bad_session", "detail": "session only applies under .argos/captures, not res://", "res_path": ""}
+	if sess == "":
+		return check_capture_out(raw)
+	if raw.is_empty():
+		var frame := _next_capture_frame(sess)
+		if frame.is_empty():
+			return {"error": "file_exists", "detail": "no free frame_NNN.png under the capture session (001-999)", "res_path": ""}
+		return check_capture_out(frame)
+	var rel := norm
+	while rel.begins_with("./"):
+		rel = rel.substr(2)
+	if not rel.contains("/"):
+		rel = ".argos/captures/%s/%s" % [sess, rel]
+	else:
+		rel = _collapse_capture_rel(rel)
+		var prefix := ".argos/captures/"
+		if rel.begins_with(prefix):
+			var rest := rel.substr(prefix.length())
+			if not rest.begins_with(sess + "/"):
+				rel = prefix + sess + "/" + rest
+	return check_capture_out(rel)
+
+
+static func _capture_session_error(session: String) -> String:
+	var raw := session.strip_edges()
+	if raw.is_empty():
+		return ""
+	if raw.length() > 64:
+		return "session must match [A-Za-z0-9_-]{1,64}"
+	for i in raw.length():
+		var c := raw.unicode_at(i)
+		var digit := c >= 48 and c <= 57
+		var upper := c >= 65 and c <= 90
+		var lower := c >= 97 and c <= 122
+		if not (digit or upper or lower or c == 45 or c == 95):
+			return "session must match [A-Za-z0-9_-]{1,64}"
+	return ""
+
+
+static func _next_capture_frame(session: String) -> String:
+	for i in range(1, 1000):
+		var rel := ".argos/captures/%s/frame_%03d.png" % [session, i]
+		if not FileAccess.file_exists("res://" + rel):
+			return rel
+	return ""
+
+
 static func prepare_capture_dir(res_path: String) -> void:
 	var parent := res_path.get_base_dir()
 	if parent.is_empty():

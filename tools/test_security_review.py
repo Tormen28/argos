@@ -3,7 +3,7 @@
 """Security fixes requested on the Hermes catalog review of e87a02a6.
 
 - plugin.json marks the argos MCP server untrusted
-- readOnlyHint only on the six genuine reads
+- readOnlyHint only on genuine reads
 - tool descriptions are English-first
 - launch / check / play stay inside ARGOS_PROJECT or ARGOS_ALLOWED_PROJECTS
 - PNG captures stay under project/.argos/captures or res://
@@ -49,6 +49,7 @@ class ReadOnlyHintTest(unittest.TestCase):
         self.assertEqual(m._READ_ONLY_TOOLS, frozenset({
             "argos_ping", "argos_status", "argos_scene_tree",
             "argos_node_get_prop", "argos_runtime_info", "argos_history",
+            "argos_anim_list", "argos_anim_get",
         }))
         seen = set()
         for tool in m.TOOLS:
