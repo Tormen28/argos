@@ -220,7 +220,9 @@ class ProjectAllowlistTest(unittest.TestCase):
              mock.patch.object(m, "ws_call", side_effect=fake_ws):
             out = m.call_tool("argos_scene_tree", {"project": str(self.other)})
         self.assertFalse(out.get("isError"))
-        self.assertIn(str(self.other), _text(out))
+        # JSON escapes backslashes, so a raw Windows path is not a substring of the text.
+        echo = pathlib.Path(json.loads(_text(out))["echo"])
+        self.assertTrue(_same(echo, self.other), echo)
 
     def test_omitted_play_does_not_fall_back_to_cwd(self):
         cwd_proj = self.tmp / "cwdproj"
