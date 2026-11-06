@@ -1,7 +1,9 @@
 extends Node
-## ARGOS Runtime v1.0.0 — servidor WebSocket DENTRO del juego para captura QA en vivo.
+## ARGOS Runtime v1.2.0 — servidor WebSocket DENTRO del juego para captura QA en vivo.
 ## Activo solo en debug builds o con el flag --argos (los exports release lo ignoran).
 ## Localhost + token compartido (.argos/token). Escribe .argos/runtime_port al arrancar.
+
+const Codec := preload("res://addons/argos/argos_codec.gd")
 
 const PORT_FIRST := 9091
 const PORT_LAST := 9100
@@ -106,9 +108,17 @@ func _handle(pid: int, txt: String) -> void:
 			_send(pid, _err(rid, "unknown_action"))
 
 func _capture(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var session := str(msg.get("session", ""))
 	var out_path := str(msg.get("out", ""))
-	if not out_path.to_lower().ends_with(".png"):
-		_send(pid, _err(rid, "bad_out", "se espera ruta .png"))
+	if session.strip_edges().is_empty() and not out_path.to_lower().ends_with(".png"):
+		_send(pid, _err(rid, "bad_out", "expected a .png path"))
+		return
+	var gate := Codec.check_capture_request(out_path, session)
+	if str(gate.get("error", "")) != "" or str(gate.get("res_path", "")).is_empty():
+		var code := str(gate.get("error", "bad_out"))
+		if code.is_empty():
+			code = "bad_out"
+		_send(pid, _err(rid, code, str(gate.get("detail", ""))))
 		return
 	if DisplayServer.get_name() == "headless":
 		_send(pid, _err(rid, "headless", "corre el juego CON ventana para capturar"))
@@ -120,11 +130,13 @@ func _capture(pid: int, rid: Variant, msg: Dictionary) -> void:
 	if img == null or img.get_width() == 0:
 		_send(pid, _err(rid, "empty_image"))
 		return
-	var err := img.save_png(out_path)
+	var res_path := str(gate["res_path"])
+	Codec.prepare_capture_dir(res_path)
+	var err := img.save_png(res_path)
 	if err != OK:
 		_send(pid, _err(rid, "save_failed", str(err)))
 		return
-	_send(pid, _ok(rid, {"path": out_path, "w": img.get_width(), "h": img.get_height(), "fps": Engine.get_frames_per_second()}))
+	_send(pid, _ok(rid, {"path": res_path, "w": img.get_width(), "h": img.get_height(), "fps": Engine.get_frames_per_second()}))
 
 func _ok(rid: Variant, result: Variant) -> Dictionary:
 	return {"ok": true, "id": rid, "result": result}

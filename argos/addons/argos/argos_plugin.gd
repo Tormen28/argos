@@ -1,6 +1,6 @@
 @tool
 extends EditorPlugin
-## ARGOS — Portal Godot (v1.0.0): edición de escenas desde fuera del editor, con undo/redo, cierre seguro y propiedades veraces.
+## ARGOS — Portal Godot (v1.2.0): edición de escenas desde fuera del editor, con undo/redo, cierre seguro y propiedades veraces.
 ## Servidor WebSocket local (127.0.0.1) para control del editor desde Hermes.
 ## Protocolo: JSON {id, token, action, ...payload} -> {ok, id, result|error, detail}
 ## BLOQUE A-2: heartbeat en .argos/heartbeat cada <=30 s (distinguir «reimportando» de «editor muerto»).
@@ -40,6 +40,7 @@ const TREE_MAX_DEPTH_DEFAULT := 12
 const TREE_MAX_DEPTH_CAP := 64
 const CAPTURE_MIN := 16              # rango valido de w/h
 const CAPTURE_MAX := 4096
+const ANIM_LIST_CAP := 256           # tope de AnimationPlayer/AnimationTree por listado
 
 # BLOQUE B3: undo grouping (action.batch). Feature AISLADA: los ops sueltos NO
 # cambian su comportamiento; solo action.batch usa el ArgosActionBuffer.
@@ -58,7 +59,6 @@ var _last_hb := -1
 var _batch: Dictionary = {}
 
 func _enter_tree() -> void:
-	randomize()
 	_ensure_credentials()
 	# BLOQUE A-2: heartbeat inmediato al activarse + periodico desde _process
 	_write_heartbeat()
@@ -132,8 +132,8 @@ func _ensure_credentials() -> void:
 		var gd := FileAccess.open("res://.argos/.gdignore", FileAccess.WRITE)
 		if gd:
 			gd.store_string("")
-	# Rotacion por sesion (COUNCIL-010): token nuevo en cada arranque del editor
-	_token = "%08x%08x%08x%08x" % [randi(), randi(), randi(), randi()]
+	# Rotacion por sesion (COUNCIL-010): token CSPRNG nuevo en cada arranque.
+	_token = new_session_token()
 	var ft := FileAccess.open(TOKEN_FILE, FileAccess.WRITE)
 	if ft:
 		ft.store_string(_token)
@@ -264,6 +264,14 @@ func _dispatch(pid: int, msg: Dictionary) -> void:
 			_node_set_prop(pid, rid, msg)
 		"node.delete":
 			_node_delete(pid, rid, msg)
+		"anim.list":
+			_anim_list(pid, rid, msg)
+		"anim.get":
+			_anim_get(pid, rid, msg)
+		"anim.play":
+			_anim_play(pid, rid, msg)
+		"anim.stop":
+			_anim_stop(pid, rid, msg)
 		"action.batch":
 			_action_batch(pid, rid, msg)
 		"run.play_main":
@@ -683,19 +691,243 @@ func _history() -> UndoRedo:
 		return eur.get_history_undo_redo(EditorUndoRedoManager.GLOBAL_HISTORY)
 	return eur.get_history_undo_redo(eur.get_object_history_id(eroot))
 
+# ---- animacion (editor scene; playback is not an undo step) ---------------
+
+func _anim_root() -> Node:
+	return EditorInterface.get_edited_scene_root()
+
+
+func _anim_rel(root: Node, node: Node) -> String:
+	if node == root:
+		return "."
+	return String(root.get_path_to(node))
+
+
+func _anim_lookup(pid: int, rid: Variant, msg: Dictionary) -> Node:
+	var root := _anim_root()
+	if root == null:
+		_send(pid, _err(rid, "no_scene", "no scene is open"))
+		return null
+	var path := str(msg.get("path", ""))
+	if path.is_empty() or path == ".":
+		return root
+	var node := Codec.find_node(root, path)
+	if node == null:
+		_send(pid, _err(rid, "no_node", path))
+		return null
+	return node
+
+
+func _anim_loop_name(mode: int) -> String:
+	if mode == Animation.LOOP_LINEAR:
+		return "linear"
+	if mode == Animation.LOOP_PINGPONG:
+		return "pingpong"
+	return "none"
+
+
+func _anim_player_summary(root: Node, player: AnimationPlayer) -> Dictionary:
+	var anims: Array = []
+	for anim_name in player.get_animation_list():
+		var anim := player.get_animation(anim_name)
+		var length := 0.0
+		var tracks := 0
+		var mode := int(Animation.LOOP_NONE)
+		if anim != null:
+			length = float(anim.length)
+			tracks = anim.get_track_count()
+			mode = int(anim.loop_mode)
+		anims.append({
+			"name": String(anim_name),
+			"length": length,
+			"loop_mode": mode,
+			"loop": _anim_loop_name(mode),
+			"track_count": tracks,
+		})
+	return {
+		"path": _anim_rel(root, player),
+		"class": "AnimationPlayer",
+		"current": String(player.current_animation),
+		"is_playing": player.is_playing(),
+		"animations": anims,
+	}
+
+
+func _anim_tree_summary(root: Node, tree: AnimationTree) -> Dictionary:
+	var player_path := ""
+	var player := tree.get_node_or_null(tree.anim_player)
+	if player != null:
+		player_path = _anim_rel(root, player)
+	var root_type := ""
+	var states: Array = []
+	var graph = tree.tree_root
+	if graph != null:
+		root_type = graph.get_class()
+		if graph.has_method("get_node_list"):
+			for state_name in graph.call("get_node_list"):
+				states.append(String(state_name))
+	return {
+		"path": _anim_rel(root, tree),
+		"class": "AnimationTree",
+		"active": bool(tree.active),
+		"anim_player": player_path,
+		"root_type": root_type,
+		"states": states,
+	}
+
+
+func _anim_collect(n: Node, root: Node, found: Dictionary) -> void:
+	var nodes: Array = found["nodes"]
+	if n is AnimationPlayer or n is AnimationTree:
+		if nodes.size() >= ANIM_LIST_CAP:
+			found["truncated"] = true
+			return
+		nodes.append({
+			"path": _anim_rel(root, n),
+			"name": String(n.name),
+			"class": n.get_class(),
+		})
+	for child in n.get_children(false):
+		if bool(found["truncated"]):
+			return
+		if child is Node:
+			_anim_collect(child, root, found)
+
+
+func _anim_list(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var start := _anim_lookup(pid, rid, msg)
+	if start == null:
+		return
+	var root := _anim_root()
+	var found := {"nodes": [], "truncated": false}
+	_anim_collect(start, root, found)
+	var path := str(msg.get("path", ""))
+	_send(pid, _ok(rid, {
+		"path": (path if not path.is_empty() else "."),
+		"nodes": found["nodes"],
+		"truncated": bool(found["truncated"]),
+	}))
+
+
+func _anim_get(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var node := _anim_lookup(pid, rid, msg)
+	if node == null:
+		return
+	var root := _anim_root()
+	if node is AnimationPlayer:
+		_send(pid, _ok(rid, _anim_player_summary(root, node)))
+	elif node is AnimationTree:
+		_send(pid, _ok(rid, _anim_tree_summary(root, node)))
+	else:
+		_send(pid, _err(rid, "bad_type", "expected AnimationPlayer or AnimationTree, got %s" % node.get_class()))
+
+
+func _anim_play(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var node := _anim_lookup(pid, rid, msg)
+	if node == null:
+		return
+	var root := _anim_root()
+	var anim_name := str(msg.get("name", ""))
+	if node is AnimationPlayer:
+		var player := node as AnimationPlayer
+		if anim_name.is_empty() or not player.has_animation(anim_name):
+			_send(pid, _err(rid, "no_anim", anim_name))
+			return
+		if msg.has("custom_speed"):
+			var sv: Variant = msg.get("custom_speed")
+			if typeof(sv) != TYPE_FLOAT and typeof(sv) != TYPE_INT:
+				_send(pid, _err(rid, "bad_speed", "custom_speed must be a number"))
+				return
+		var speed := float(msg.get("custom_speed", 1.0))
+		var from_end := bool(msg.get("from_end", false))
+		player.play(anim_name, -1.0, speed, from_end)
+		_send(pid, _ok(rid, {
+			"path": _anim_rel(root, player),
+			"class": "AnimationPlayer",
+			"playing": anim_name,
+			"custom_speed": speed,
+			"from_end": from_end,
+		}))
+		return
+	if node is AnimationTree:
+		var tree := node as AnimationTree
+		var rel := _anim_rel(root, tree)
+		if anim_name.is_empty():
+			tree.active = true
+			_send(pid, _ok(rid, {"path": rel, "class": "AnimationTree", "active": true}))
+			return
+		var names: Array = []
+		var graph = tree.tree_root
+		if graph != null and graph.has_method("get_node_list"):
+			for state_name in graph.call("get_node_list"):
+				names.append(String(state_name))
+		if not names.has(anim_name):
+			_send(pid, _err(rid, "no_anim", anim_name))
+			return
+		var playback = tree.get("parameters/playback")
+		if playback == null or not playback.has_method("travel"):
+			_send(pid, _err(rid, "no_anim", "AnimationTree has no state playback"))
+			return
+		tree.active = true
+		playback.travel(anim_name)
+		_send(pid, _ok(rid, {"path": rel, "class": "AnimationTree", "active": true, "traveled": anim_name}))
+		return
+	_send(pid, _err(rid, "bad_type", "expected AnimationPlayer or AnimationTree, got %s" % node.get_class()))
+
+
+func _anim_stop(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var node := _anim_lookup(pid, rid, msg)
+	if node == null:
+		return
+	var root := _anim_root()
+	var seek_zero := true
+	if msg.has("seek_zero"):
+		seek_zero = bool(msg.get("seek_zero"))
+	if node is AnimationPlayer:
+		var player := node as AnimationPlayer
+		if seek_zero:
+			player.stop(false)
+			player.seek(0.0, true)
+		else:
+			player.stop(true)
+		_send(pid, _ok(rid, {
+			"path": _anim_rel(root, player),
+			"class": "AnimationPlayer",
+			"stopped": true,
+			"seek_zero": seek_zero,
+		}))
+		return
+	if node is AnimationTree:
+		var tree := node as AnimationTree
+		tree.active = false
+		_send(pid, _ok(rid, {
+			"path": _anim_rel(root, tree),
+			"class": "AnimationTree",
+			"stopped": true,
+			"active": false,
+		}))
+		return
+	_send(pid, _err(rid, "bad_type", "expected AnimationPlayer or AnimationTree, got %s" % node.get_class()))
+
+
 # ---- captura ----
 
 func _capture_scene(pid: int, rid: Variant, msg: Dictionary) -> void:
 	# B1: la validación de entrada precede al chequeo de entorno (errores estables
-	# en headless: bad_out/bad_size en vez de headless).
+	# en headless: bad_out/bad_size en vez de headless). El tamaño se informa
+	# antes del confinamiento de ruta para conservar ese código.
+	var session := str(msg.get("session", ""))
 	var out_path := str(msg.get("out", ""))
-	if not out_path.to_lower().ends_with(".png"):
-		_send(pid, _err(rid, "bad_out", "se espera ruta .png"))
+	if session.strip_edges().is_empty() and not out_path.to_lower().ends_with(".png"):
+		_send(pid, _err(rid, "bad_out", "expected a .png path"))
 		return
 	var w := int(msg.get("w", 1152))
 	var h := int(msg.get("h", 648))
 	if w < CAPTURE_MIN or w > CAPTURE_MAX or h < CAPTURE_MIN or h > CAPTURE_MAX:
 		_send(pid, _err(rid, "bad_size", "%dx%d (rango %d..%d)" % [w, h, CAPTURE_MIN, CAPTURE_MAX]))
+		return
+	var gate := Codec.check_capture_request(out_path, session)
+	if not _capture_gate_ok(pid, rid, gate):
 		return
 	if DisplayServer.get_name() == "headless":
 		_send(pid, _err(rid, "headless", "captura requiere editor CON VENTANA (no headless)"))
@@ -735,16 +967,22 @@ func _capture_scene(pid: int, rid: Variant, msg: Dictionary) -> void:
 		return
 	var iw := img.get_width()
 	var ih := img.get_height()
-	var err := img.save_png(out_path)
-	if err != OK:
-		_send(pid, _err(rid, "save_failed", str(err)))
+	var saved := _save_capture_png(img, str(gate["res_path"]))
+	if str(saved["error"]) != "":
+		_send(pid, _err(rid, str(saved["error"]), str(saved["detail"])))
 		return
-	_send(pid, _ok(rid, {"path": out_path, "w": iw, "h": ih, "scene": scene_path}))
+	_send(pid, _ok(rid, {"path": str(gate["res_path"]), "w": iw, "h": ih, "scene": scene_path}))
 
 func _capture_editor_2d(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var session := str(msg.get("session", ""))
 	var out_path := str(msg.get("path", ""))
-	if not out_path.to_lower().ends_with(".png"):
-		_send(pid, _err(rid, "bad_out", "se espera ruta .png"))
+	if out_path.is_empty():
+		out_path = str(msg.get("out", ""))
+	if session.strip_edges().is_empty() and not out_path.to_lower().ends_with(".png"):
+		_send(pid, _err(rid, "bad_out", "expected a .png path"))
+		return
+	var gate := Codec.check_capture_request(out_path, session)
+	if not _capture_gate_ok(pid, rid, gate):
 		return
 	if DisplayServer.get_name() == "headless":
 		_send(pid, _err(rid, "headless", "captura requiere editor CON VENTANA (no headless)"))
@@ -768,13 +1006,41 @@ func _capture_editor_2d(pid: int, rid: Variant, msg: Dictionary) -> void:
 	if img == null or img.get_width() == 0:
 		_send(pid, _err(rid, "empty_image", "headless?"))
 		return
-	var err := img.save_png(out_path)
-	if err != OK:
-		_send(pid, _err(rid, "save_failed", str(err)))
+	var saved := _save_capture_png(img, str(gate["res_path"]))
+	if str(saved["error"]) != "":
+		_send(pid, _err(rid, str(saved["error"]), str(saved["detail"])))
 		return
-	_send(pid, _ok(rid, {"path": out_path, "w": img.get_width(), "h": img.get_height()}))
+	_send(pid, _ok(rid, {"path": str(gate["res_path"]), "w": img.get_width(), "h": img.get_height()}))
 
 # ---- estado / transporte ----
+
+static func new_session_token() -> String:
+	## 16 bytes from Crypto.generate_random_bytes, as hex.
+	var crypto := Crypto.new()
+	var raw := crypto.generate_random_bytes(16)
+	var hex := ""
+	for b in raw:
+		hex += "%02x" % b
+	return hex
+
+
+func _capture_gate_ok(pid: int, rid: Variant, gate: Dictionary) -> bool:
+	if str(gate.get("error", "")) != "" or str(gate.get("res_path", "")).is_empty():
+		var code := str(gate.get("error", "bad_out"))
+		if code.is_empty():
+			code = "bad_out"
+		_send(pid, _err(rid, code, str(gate.get("detail", ""))))
+		return false
+	return true
+
+
+func _save_capture_png(img: Image, res_path: String) -> Dictionary:
+	Codec.prepare_capture_dir(res_path)
+	var err := img.save_png(res_path)
+	if err != OK:
+		return {"error": "save_failed", "detail": str(err)}
+	return {"error": "", "detail": ""}
+
 
 func _status() -> Dictionary:
 	var root := EditorInterface.get_edited_scene_root()

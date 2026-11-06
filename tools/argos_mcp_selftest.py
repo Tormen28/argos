@@ -30,7 +30,7 @@ from argos_selftest import load_state, save_state  # noqa: E402 (reuso del estad
 
 PY = sys.executable
 STATE_FILENAME = "selftest_mcp_state.json"
-EXPECTED_TOOLS = 27  # 26 + argos_history (BLOQUE B2)
+EXPECTED_TOOLS = 33  # 27 at 1.1.0 + batch, 4 anim tools, editor capture (1.2.0)
 
 
 def recv(proc):
@@ -115,8 +115,11 @@ def main():
             print("PROTO tools/list: OK n=%d" % len(tools))
             if len(tools) != EXPECTED_TOOLS:
                 failures.append("tools/list(n=%d, esperado %d)" % (len(tools), EXPECTED_TOOLS))
-            if "argos_history" not in tools:
-                failures.append("tools/list(sin argos_history)")
+            for required in ("argos_history", "argos_action_batch", "argos_anim_list",
+                             "argos_anim_get", "argos_anim_play", "argos_anim_stop",
+                             "argos_capture_editor_2d"):
+                if required not in tools:
+                    failures.append("tools/list(sin %s)" % required)
             # B2: argos_history responde (lee .argos/history.json; no requiere editor)
             hr = call("argos_history", {"limit": 5}, 3)
             htext = text_of(hr)

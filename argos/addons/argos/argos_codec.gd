@@ -93,3 +93,140 @@ static func dump_node(n: Node, root: Node, budget: Dictionary, depth: int, max_d
 	if not kids.is_empty():
 		d["children"] = kids
 	return d
+
+
+# --- capturas (PNG) -----------------------------------------------------------
+# Solo res://...png o .argos/captures/...png. Se rechazan rutas absolutas y
+# cualquier segmento "..", y no se pisa un archivo existente.
+
+static func check_capture_out(out_path: String) -> Dictionary:
+	## "" en error si la ruta es escribible. Si no: bad_out o file_exists.
+	## res_path es la ruta res:// canonica a la que hay que guardar.
+	var raw := out_path.strip_edges()
+	if raw.is_empty() or not raw.to_lower().ends_with(".png"):
+		return {"error": "bad_out", "detail": "expected a .png path", "res_path": ""}
+	if raw.contains(char(0)):
+		return {"error": "bad_out", "detail": "path contains NUL", "res_path": ""}
+	var norm := raw.replace("\\", "/")
+	if norm.split("/").has(".."):
+		return {"error": "bad_out", "detail": "path must not contain '..'", "res_path": ""}
+	var res_path := ""
+	if norm.begins_with("res://"):
+		var rest := norm.substr(6)
+		if rest.begins_with("/") or _capture_path_is_absolute(rest):
+			return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+		res_path = "res://" + _collapse_capture_rel(rest)
+	else:
+		if _capture_path_is_absolute(norm):
+			return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+		var rel := norm
+		while rel.begins_with("./"):
+			rel = rel.substr(2)
+		rel = _collapse_capture_rel(rel)
+		if not rel.begins_with(".argos/captures/") or rel.ends_with("/"):
+			return {"error": "bad_out", "detail": "PNG must be under .argos/captures or res://", "res_path": ""}
+		res_path = "res://" + rel
+	if not res_path.to_lower().ends_with(".png") or res_path.ends_with("/"):
+		return {"error": "bad_out", "detail": "expected a .png file", "res_path": ""}
+	if FileAccess.file_exists(res_path):
+		return {"error": "file_exists", "detail": "refusing to overwrite an existing file", "res_path": ""}
+	var global_path := ProjectSettings.globalize_path(res_path)
+	if DirAccess.dir_exists_absolute(global_path):
+		return {"error": "file_exists", "detail": "refusing to overwrite an existing file", "res_path": ""}
+	return {"error": "", "detail": "", "res_path": res_path}
+
+
+static func check_capture_request(out_path: String, session: String = "") -> Dictionary:
+	## Same gates as check_capture_out, plus an optional capture session.
+	## Session names are [A-Za-z0-9_-]{1,64}. Files land in
+	## .argos/captures/<session>/. An empty out_path allocates frame_NNN.png.
+	## A session cannot retarget res://, absolute paths, or "..".
+	var sess_detail := _capture_session_error(session)
+	if sess_detail != "":
+		return {"error": "bad_session", "detail": sess_detail, "res_path": ""}
+	var sess := session.strip_edges()
+	var raw := out_path.strip_edges()
+	if raw.contains(char(0)):
+		return {"error": "bad_out", "detail": "path contains NUL", "res_path": ""}
+	var norm := raw.replace("\\", "/")
+	if norm.split("/").has(".."):
+		return {"error": "bad_out", "detail": "path must not contain '..'", "res_path": ""}
+	if _capture_path_is_absolute(norm):
+		return {"error": "bad_out", "detail": "absolute paths are not allowed", "res_path": ""}
+	if sess != "" and norm.begins_with("res://"):
+		return {"error": "bad_session", "detail": "session only applies under .argos/captures, not res://", "res_path": ""}
+	if sess == "":
+		return check_capture_out(raw)
+	if raw.is_empty():
+		var frame := _next_capture_frame(sess)
+		if frame.is_empty():
+			return {"error": "file_exists", "detail": "no free frame_NNN.png under the capture session (001-999)", "res_path": ""}
+		return check_capture_out(frame)
+	var rel := norm
+	while rel.begins_with("./"):
+		rel = rel.substr(2)
+	if not rel.contains("/"):
+		rel = ".argos/captures/%s/%s" % [sess, rel]
+	else:
+		rel = _collapse_capture_rel(rel)
+		var prefix := ".argos/captures/"
+		if rel.begins_with(prefix):
+			var rest := rel.substr(prefix.length())
+			if not rest.begins_with(sess + "/"):
+				rel = prefix + sess + "/" + rest
+	return check_capture_out(rel)
+
+
+static func _capture_session_error(session: String) -> String:
+	var raw := session.strip_edges()
+	if raw.is_empty():
+		return ""
+	if raw.length() > 64:
+		return "session must match [A-Za-z0-9_-]{1,64}"
+	for i in raw.length():
+		var c := raw.unicode_at(i)
+		var digit := c >= 48 and c <= 57
+		var upper := c >= 65 and c <= 90
+		var lower := c >= 97 and c <= 122
+		if not (digit or upper or lower or c == 45 or c == 95):
+			return "session must match [A-Za-z0-9_-]{1,64}"
+	return ""
+
+
+static func _next_capture_frame(session: String) -> String:
+	for i in range(1, 1000):
+		var rel := ".argos/captures/%s/frame_%03d.png" % [session, i]
+		if not FileAccess.file_exists("res://" + rel):
+			return rel
+	return ""
+
+
+static func prepare_capture_dir(res_path: String) -> void:
+	var parent := res_path.get_base_dir()
+	if parent.is_empty():
+		return
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(parent))
+
+
+static func _collapse_capture_rel(rel: String) -> String:
+	var kept := PackedStringArray()
+	for seg in rel.split("/"):
+		if seg.is_empty() or seg == ".":
+			continue
+		kept.append(seg)
+	return "/".join(kept)
+
+
+static func _capture_path_is_absolute(norm: String) -> bool:
+	if norm.begins_with("/") or norm.begins_with("//"):
+		return true
+	if norm.length() >= 3 and norm.substr(1, 2) == ":/" and _capture_is_drive_letter(norm.substr(0, 1)):
+		return true
+	return false
+
+
+static func _capture_is_drive_letter(ch: String) -> bool:
+	if ch.is_empty():
+		return false
+	var c := ch.unicode_at(0)
+	return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)

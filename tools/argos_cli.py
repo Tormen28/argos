@@ -7,7 +7,7 @@ Ejemplos:
   python argos_cli.py --project C:/path/proj tree
   python argos_cli.py --project C:/path/proj node-create . Label MiLabel '{"text":"Hola"}'
   python argos_cli.py --project C:/path/proj node-set MiLabel text Hola
-  python argos_cli.py --project C:/path/proj capture C:/tmp/op.png
+  python argos_cli.py --project C:/path/proj capture .argos/captures/op.png
 """
 import argparse
 import json

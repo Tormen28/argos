@@ -135,3 +135,37 @@ func test_dump_node_incluye_script_si_tiene() -> void:
 	var budget := {"count": 0, "max_nodes": 100, "truncated": false}
 	var d := Codec.dump_node(n, n, budget, 0, 12)
 	assert_eq(d.get("script"), "res://addons/argos/argos_runtime.gd")
+
+
+# --- capturas: solo res:// o .argos/captures, sin absolutas, sin "..", sin pisar ---
+
+func test_capture_rechaza_absoluta_y_punto_punto() -> void:
+	assert_eq(Codec.check_capture_out("C:/tmp/a.png")["error"], "bad_out")
+	assert_eq(Codec.check_capture_out("/tmp/a.png")["error"], "bad_out")
+	assert_eq(Codec.check_capture_out("res://../secret.png")["error"], "bad_out")
+	assert_eq(Codec.check_capture_out(".argos/captures/../../secret.png")["error"], "bad_out")
+	assert_eq(Codec.check_capture_out("shots/a.png")["error"], "bad_out")
+	assert_eq(Codec.check_capture_out("a.jpg")["error"], "bad_out")
+
+
+func test_capture_acepta_res_y_captures() -> void:
+	var res_gate := Codec.check_capture_out("res://shots/argos_codec_capture_unlikely.png")
+	assert_eq(res_gate["error"], "", res_gate["detail"])
+	assert_eq(res_gate["res_path"], "res://shots/argos_codec_capture_unlikely.png")
+	var rel_gate := Codec.check_capture_out("./.argos/captures/argos_codec_capture_unlikely.png")
+	assert_eq(rel_gate["error"], "", rel_gate["detail"])
+	assert_eq(rel_gate["res_path"], "res://.argos/captures/argos_codec_capture_unlikely.png")
+
+
+func test_capture_session_rechaza_escape() -> void:
+	assert_eq(Codec.check_capture_request("shot.png", "../x")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request("shot.png", "a/b")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request("res://shots/a.png", "qa")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request(".argos/captures/../../secret.png", "qa")["error"], "bad_out")
+	assert_eq(Codec.check_capture_request("/tmp/a.png", "qa")["error"], "bad_out")
+
+
+func test_capture_session_nombre_explicito() -> void:
+	var gate := Codec.check_capture_request("argos_leap_session_unlikely.png", "qa_run-1")
+	assert_eq(gate["error"], "", gate["detail"])
+	assert_eq(gate["res_path"], "res://.argos/captures/qa_run-1/argos_leap_session_unlikely.png")

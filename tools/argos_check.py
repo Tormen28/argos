@@ -24,10 +24,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import argos_errors  # noqa: E402
 
-GODOT = os.environ.get(
-    "ARGOS_GODOT",
-    os.path.expanduser("~/tools/godot/4.7.2-stable/Godot_v4.7.2-stable_win64_console.exe"),
-)
+from argos_editor import default_godot_executable  # noqa: E402
+
+GODOT = os.environ.get("ARGOS_GODOT", default_godot_executable())
 
 
 def collect_targets(project: str, targets, all_flag: bool):
