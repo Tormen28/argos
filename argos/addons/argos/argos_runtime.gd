@@ -1,5 +1,5 @@
 extends Node
-## ARGOS Runtime v1.1.0 — servidor WebSocket DENTRO del juego para captura QA en vivo.
+## ARGOS Runtime v1.2.0 — servidor WebSocket DENTRO del juego para captura QA en vivo.
 ## Activo solo en debug builds o con el flag --argos (los exports release lo ignoran).
 ## Localhost + token compartido (.argos/token). Escribe .argos/runtime_port al arrancar.
 
@@ -108,11 +108,12 @@ func _handle(pid: int, txt: String) -> void:
 			_send(pid, _err(rid, "unknown_action"))
 
 func _capture(pid: int, rid: Variant, msg: Dictionary) -> void:
+	var session := str(msg.get("session", ""))
 	var out_path := str(msg.get("out", ""))
-	if not out_path.to_lower().ends_with(".png"):
+	if session.strip_edges().is_empty() and not out_path.to_lower().ends_with(".png"):
 		_send(pid, _err(rid, "bad_out", "expected a .png path"))
 		return
-	var gate := Codec.check_capture_out(out_path)
+	var gate := Codec.check_capture_request(out_path, session)
 	if str(gate.get("error", "")) != "" or str(gate.get("res_path", "")).is_empty():
 		var code := str(gate.get("error", "bad_out"))
 		if code.is_empty():

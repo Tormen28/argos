@@ -2,7 +2,16 @@
 
 **English** · [Español](#español)
 
-ARGOS lets a Hermes agent work inside a **live Godot 4 editor**: read the scene tree, create / move / delete nodes, change properties with the editor's **real undo**, open and save scenes, play and stop the game, validate GDScript and take screenshots. The Godot addon *is* the server (a local WebSocket on `127.0.0.1`), and `tools/argos_mcp.py` exposes it to Hermes as an MCP server with **27 tools**.
+ARGOS lets a Hermes agent work inside a **live Godot 4 editor**: read the scene tree, create / move / delete nodes, change properties with the editor's **real undo**, batch those edits into one undo group, play animations, open and save scenes, play and stop the game, validate GDScript and take screenshots. The Godot addon *is* the server (a local WebSocket on `127.0.0.1`), and `tools/argos_mcp.py` exposes it to Hermes as an MCP server with **33 tools**.
+
+## What's new in 1.2.0
+
+- `argos_action_batch` runs up to 64 node edits as one undo group.
+- `argos_anim_list` and `argos_anim_get` are read-only. `argos_anim_play` and `argos_anim_stop` control an `AnimationPlayer` or `AnimationTree` in the edited scene.
+- `argos_capture_editor_2d` captures the 2D editor viewport. Scene, editor, and runtime captures take an optional `session` and write PNGs under `.argos/captures/<session>/`. If the file name is omitted, the next free `frame_NNN.png` is used and an existing file is never overwritten. GIF export is not included.
+- A refused launch, check, or play returns `project_not_allowed` with the attempted path, the allowlist, and a hint. It does not list the rest of the disk.
+
+Security invariants from 1.1.0 are unchanged: `trust` stays `untrusted`, `readOnlyHint` is only on pure reads, launch/check/play stay on `ARGOS_PROJECT` or `ARGOS_ALLOWED_PROJECTS`, and captures stay under `res://` or `.argos/captures/`.
 
 ![Scene built by a Hermes agent through ARGOS](docs/screenshots/argos-scene-capture.png)
 ![The same scene in the Godot editor](docs/screenshots/argos-godot-editor.png)
@@ -58,7 +67,7 @@ Open the project in Godot (or let the agent run `argos_editor_launch`) and check
 
 ```bash
 pip install -r requirements.txt pytest
-python -m pytest tools -q          # 162 tests, no Godot needed
+python -m pytest tools -q          # 182 tests, no Godot needed
 python tools/argos_mcp_selftest.py <project> --require-editor   # live, editor open
 ```
 
@@ -68,7 +77,16 @@ License: MIT © Tormen28
 
 ## Español
 
-ARGOS permite que un agente de Hermes trabaje dentro de un **editor de Godot 4 abierto**: leer el árbol de escena, crear / mover / borrar nodos, cambiar propiedades con el **deshacer real** del editor, abrir y guardar escenas, ejecutar y detener el juego, validar GDScript y sacar capturas. El addon de Godot *es* el servidor (WebSocket local en `127.0.0.1`), y `tools/argos_mcp.py` lo expone a Hermes como servidor MCP con **27 herramientas**.
+ARGOS permite que un agente de Hermes trabaje dentro de un **editor de Godot 4 abierto**: leer el árbol de escena, crear / mover / borrar nodos, cambiar propiedades con el **deshacer real** del editor, agrupar ediciones en un solo deshacer, reproducir animaciones, abrir y guardar escenas, ejecutar y detener el juego, validar GDScript y sacar capturas. El addon de Godot *es* el servidor (WebSocket local en `127.0.0.1`), y `tools/argos_mcp.py` lo expone a Hermes como servidor MCP con **33 herramientas**.
+
+### Novedades en 1.2.0
+
+- `argos_action_batch` aplica hasta 64 ediciones de nodos como un solo grupo de deshacer.
+- `argos_anim_list` y `argos_anim_get` son de solo lectura. `argos_anim_play` y `argos_anim_stop` controlan un `AnimationPlayer` o `AnimationTree` de la escena editada.
+- `argos_capture_editor_2d` captura el viewport 2D del editor. Las capturas de escena, editor y runtime aceptan `session` y escriben PNG en `.argos/captures/<session>/`. Si omites el nombre, se usa el siguiente `frame_NNN.png` libre y nunca se pisa un archivo. No hay exportación a GIF.
+- Si launch, check o play rechazan un proyecto, el error es `project_not_allowed` con la ruta intentada, la lista permitida y una pista. No lista el resto del disco.
+
+Los invariantes de seguridad de 1.1.0 se mantienen: `trust` sigue en `untrusted`, `readOnlyHint` solo en lecturas puras, launch/check/play se quedan en `ARGOS_PROJECT` o `ARGOS_ALLOWED_PROJECTS`, y las capturas se quedan en `res://` o `.argos/captures/`.
 
 ### Requisitos
 
@@ -121,7 +139,7 @@ Abre el proyecto en Godot (o deja que el agente use `argos_editor_launch`) y com
 
 ```bash
 pip install -r requirements.txt pytest
-python -m pytest tools -q          # 162 pruebas, sin Godot
+python -m pytest tools -q          # 182 pruebas, sin Godot
 python tools/argos_mcp_selftest.py <proyecto> --require-editor   # en vivo, con el editor abierto
 ```
 

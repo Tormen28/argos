@@ -155,3 +155,17 @@ func test_capture_acepta_res_y_captures() -> void:
 	var rel_gate := Codec.check_capture_out("./.argos/captures/argos_codec_capture_unlikely.png")
 	assert_eq(rel_gate["error"], "", rel_gate["detail"])
 	assert_eq(rel_gate["res_path"], "res://.argos/captures/argos_codec_capture_unlikely.png")
+
+
+func test_capture_session_rechaza_escape() -> void:
+	assert_eq(Codec.check_capture_request("shot.png", "../x")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request("shot.png", "a/b")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request("res://shots/a.png", "qa")["error"], "bad_session")
+	assert_eq(Codec.check_capture_request(".argos/captures/../../secret.png", "qa")["error"], "bad_out")
+	assert_eq(Codec.check_capture_request("/tmp/a.png", "qa")["error"], "bad_out")
+
+
+func test_capture_session_nombre_explicito() -> void:
+	var gate := Codec.check_capture_request("argos_leap_session_unlikely.png", "qa_run-1")
+	assert_eq(gate["error"], "", gate["detail"])
+	assert_eq(gate["res_path"], "res://.argos/captures/qa_run-1/argos_leap_session_unlikely.png")
