@@ -2,6 +2,8 @@
 
 **English** · [Español](#español)
 
+![ARGOS](img/argos.jpg)
+
 ARGOS lets a Hermes agent work inside a **live Godot 4 editor**: read the scene tree, create / move / delete nodes, change properties with the editor's **real undo**, batch those edits into one undo group, play animations, open and save scenes, play and stop the game, validate GDScript and take screenshots. The Godot addon *is* the server (a local WebSocket on `127.0.0.1`), and `tools/argos_mcp.py` exposes it to Hermes as an MCP server with **33 tools**.
 
 ## What's new in 1.2.0
@@ -76,6 +78,8 @@ License: MIT © Tormen28
 ---
 
 ## Español
+
+![ARGOS](img/argos.jpg)
 
 ARGOS permite que un agente de Hermes trabaje dentro de un **editor de Godot 4 abierto**: leer el árbol de escena, crear / mover / borrar nodos, cambiar propiedades con el **deshacer real** del editor, agrupar ediciones en un solo deshacer, reproducir animaciones, abrir y guardar escenas, ejecutar y detener el juego, validar GDScript y sacar capturas. El addon de Godot *es* el servidor (WebSocket local en `127.0.0.1`), y `tools/argos_mcp.py` lo expone a Hermes como servidor MCP con **33 herramientas**.
 
